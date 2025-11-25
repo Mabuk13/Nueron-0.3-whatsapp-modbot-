@@ -1,0 +1,29 @@
+2025/11/24-21:47:31.307 2d48 Reusing MANIFEST C:\Users\pc\wwebjs-bot\.wwebjs_auth\session-modbot\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/MANIFEST-000001
+2025/11/24-21:47:31.308 2d48 Recovering log #350
+2025/11/24-21:47:32.073 2d48 Reusing old log C:\Users\pc\wwebjs-bot\.wwebjs_auth\session-modbot\Default\IndexedDB\https_web.whatsapp.com_0.indexeddb.leveldb/000350.log 
+2025/11/24-21:47:48.020 2a00 Level-0 table #361: started
+2025/11/24-21:47:48.429 2a00 Level-0 table #361: 789134 bytes OK
+2025/11/24-21:47:48.437 2a00 Delete type=0 #350
+2025/11/24-21:47:48.439 2a00 Manual compaction at level-0 from '\x00.\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00/\x00\x00\x00' @ 0 : 0; will stop at (end)
+2025/11/24-21:48:15.333 2d48 Compacting 1@1 + 7@2 files
+2025/11/24-21:48:15.894 2d48 Generated table #362@1: 54677 keys, 2232098 bytes
+2025/11/24-21:48:16.868 2d48 Generated table #363@1: 26725 keys, 2191085 bytes
+2025/11/24-21:48:17.069 2d48 Generated table #364@1: 1715 keys, 2140978 bytes
+2025/11/24-21:48:17.544 2d48 Generated table #365@1: 13143 keys, 2199728 bytes
+2025/11/24-21:48:18.892 2d48 Generated table #366@1: 30812 keys, 2215309 bytes
+2025/11/24-21:48:19.537 2d48 Generated table #367@1: 66484 keys, 2205628 bytes
+2025/11/24-21:48:20.080 2d48 Generated table #368@1: 45399 keys, 983413 bytes
+2025/11/24-21:48:20.080 2d48 Compacted 1@1 + 7@2 files => 14168239 bytes
+2025/11/24-21:48:20.082 2d48 compacted to: files[ 0 0 7 0 0 0 0 ]
+2025/11/24-21:48:20.083 2d48 Delete type=2 #352
+2025/11/24-21:48:20.084 2d48 Delete type=2 #353
+2025/11/24-21:48:20.084 2d48 Delete type=2 #354
+2025/11/24-21:48:20.084 2d48 Delete type=2 #355
+2025/11/24-21:48:20.084 2d48 Delete type=2 #356
+2025/11/24-21:48:20.084 2d48 Delete type=2 #357
+2025/11/24-21:48:20.085 2d48 Delete type=2 #358
+2025/11/24-21:48:20.085 2d48 Delete type=2 #361
+2025/11/24-21:56:25.500 37bc Level-0 table #370: started
+2025/11/24-21:56:25.915 37bc Level-0 table #370: 1182288 bytes OK
+2025/11/24-21:56:25.927 37bc Delete type=0 #360
+2025/11/24-21:56:30.519 3578 Compacting 1@1 + 7@2 files

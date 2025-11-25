@@ -1,0 +1,5 @@
+2025/11/25-18:12:01.291 63c Creating DB C:\Users\pc\wwebjs-bot1\.wwebjs_auth\session-default\Default\Local Storage\leveldb since it was missing.
+2025/11/25-18:12:01.313 63c Reusing MANIFEST C:\Users\pc\wwebjs-bot1\.wwebjs_auth\session-default\Default\Local Storage\leveldb/MANIFEST-000001
+2025/11/25-18:52:27.143 63c Level-0 table #5: started
+2025/11/25-18:52:27.150 63c Level-0 table #5: 18953 bytes OK
+2025/11/25-18:52:27.156 63c Delete type=0 #3
