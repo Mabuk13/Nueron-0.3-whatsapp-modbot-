@@ -29,7 +29,7 @@ const fs = require("fs");
 const path = require("path");
 
 const WARNINGS_FILE = path.join(__dirname, "warnings.json");
-const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || "6RL3 of 2025";
+const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || "6-3 of '25";
 const WARNINGS_THRESHOLD = parseInt(process.env.WARNINGS_THRESHOLD || "3", 10);
 let moderationActive = (process.env.MODERATION_ACTIVE || "true").toLowerCase() === "true";
 
