@@ -1,6 +1,0 @@
-2025/11/24-09:08:25.651 2780 Reusing MANIFEST C:\Users\pc\wwebjs-bot\.wwebjs_auth\session\Default\Local Storage\leveldb/MANIFEST-000001
-2025/11/24-09:08:25.657 2780 Recovering log #11
-2025/11/24-09:08:25.659 2780 Reusing old log C:\Users\pc\wwebjs-bot\.wwebjs_auth\session\Default\Local Storage\leveldb/000011.log 
-2025/11/24-09:16:27.672 2240 Level-0 table #14: started
-2025/11/24-09:16:27.681 2240 Level-0 table #14: 14349 bytes OK
-2025/11/24-09:16:27.683 2240 Delete type=0 #11
