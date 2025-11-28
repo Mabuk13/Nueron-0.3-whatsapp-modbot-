@@ -2,20 +2,21 @@
  * index.js
  * Railway-compatible WhatsApp moderation bot using whatsapp-web.js
  *
- * Environment vars:
+ * Environment vars (added/changed options):
  *   BANNED_WORDS         (optional) comma separated list of banned words
  *   ALLOWED_NUMBERS      (optional) comma separated numbers (digits only or with +)
  *   TARGET_GROUP_NAME    (optional) group name to moderate (default: "6RL3 of 2025")
  *   WARNINGS_THRESHOLD   (optional) number of warnings before removing (default: 3)
  *   MODERATION_ACTIVE    (optional) "true" or "false" starting state (default: true)
+ *   FORCE_QR             (optional) "true" to delete existing LocalAuth session and force QR on startup
+ *   CHROMIUM_PATH        (optional) path to Chromium/Chrome binary if needed on the host
  *
  * Requires:
  *   npm install whatsapp-web.js qrcode-terminal
  *
  * Notes:
  * - Bot must be admin in target group to delete messages / remove participants.
- * - LocalAuth stores session on disk (Railway ephemeral disk may be cleared on redeploy).
- *   If Railway restarts, you'll need to scan QR again (QR prints to logs).
+ * - Railway ephemeral disk will lose LocalAuth on redeploy; use FORCE_QR=true to force fresh QR.
  */
 
 // ----------------- Moderation rules (exact snippet requested) -----------------
@@ -29,9 +30,32 @@ const fs = require("fs");
 const path = require("path");
 
 const WARNINGS_FILE = path.join(__dirname, "warnings.json");
-const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || "6-3 of '25";
+const TARGET_GROUP_NAME = process.env.TARGET_GROUP_NAME || "6RL3 of 2025";
 const WARNINGS_THRESHOLD = parseInt(process.env.WARNINGS_THRESHOLD || "3", 10);
 let moderationActive = (process.env.MODERATION_ACTIVE || "true").toLowerCase() === "true";
+
+// Option to force QR by removing existing LocalAuth store for this clientId
+const FORCE_QR = (process.env.FORCE_QR || "false").toLowerCase() === "true";
+const CLIENT_ID = "modbot"; // used by LocalAuth (and to locate its folder if forcing QR)
+const LOCAL_AUTH_BASE = path.join(process.cwd(), ".wwebjs_auth", CLIENT_ID);
+
+if (FORCE_QR) {
+  try {
+    if (fs.existsSync(LOCAL_AUTH_BASE)) {
+      // Node versions differ; try rmSync, else rmdirSync as fallback
+      if (fs.rmSync) {
+        fs.rmSync(LOCAL_AUTH_BASE, { recursive: true, force: true });
+      } else {
+        fs.rmdirSync(LOCAL_AUTH_BASE, { recursive: true });
+      }
+      console.log(`FORCE_QR enabled — removed LocalAuth folder: ${LOCAL_AUTH_BASE}`);
+    } else {
+      console.log("FORCE_QR enabled — no existing LocalAuth folder to remove.");
+    }
+  } catch (e) {
+    console.warn("FORCE_QR: failed to remove LocalAuth folder:", e && e.message ? e.message : e);
+  }
+}
 
 const puppeteerArgs = [
   '--no-sandbox',
@@ -43,24 +67,38 @@ const puppeteerArgs = [
   '--disable-gpu'
 ];
 
+// allow optional CHROMIUM_PATH env var for hosts that provide a binary path
+const puppeteerOptions = {
+  headless: true,
+  args: puppeteerArgs
+};
+if (process.env.CHROMIUM_PATH) {
+  puppeteerOptions.executablePath = process.env.CHROMIUM_PATH;
+}
+
+// small util: escape for regex
 function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Build a robust word-boundary regex using Unicode properties so punctuation/Unicode works better
 const bannedArray = Array.from(bannedWords).map(w => escapeRegExp(w)).filter(Boolean);
-const bannedRegex = bannedArray.length ? new RegExp(`\\b(${bannedArray.join('|')})\\b`, 'i') : null;
+const bannedRegex = bannedArray.length
+  ? new RegExp(`(^|[^\\p{L}\\p{N}])(${bannedArray.join('|')})([^\\p{L}\\p{N}]|$)`, 'iu')
+  : null;
 
 // Load/store warnings
 let warnings = {};
 function loadWarnings() {
   try {
     if (fs.existsSync(WARNINGS_FILE)) {
-      warnings = JSON.parse(fs.readFileSync(WARNINGS_FILE, 'utf8') || "{}");
+      const raw = fs.readFileSync(WARNINGS_FILE, 'utf8') || "{}";
+      warnings = JSON.parse(raw);
     } else {
       warnings = {};
     }
   } catch (e) {
-    console.error("Failed to load warnings:", e);
+    console.error("Failed to load warnings:", e && e.message ? e.message : e);
     warnings = {};
   }
 }
@@ -68,7 +106,7 @@ function saveWarnings() {
   try {
     fs.writeFileSync(WARNINGS_FILE, JSON.stringify(warnings, null, 2));
   } catch (e) {
-    console.error("Failed to save warnings:", e);
+    console.error("Failed to save warnings:", e && e.message ? e.message : e);
   }
 }
 
@@ -91,17 +129,21 @@ function isAllowedNumberDigits(digits) {
 // Helper to format allowedNumbers for the startup message
 function humanListAllowedNumbers() {
   if (!allowedNumbers.length) return "No admin numbers configured.";
-  return allowedNumbers.map(n => `+${n}`).join(", ");
+  return allowedNumbers.map(n => {
+    // if starts with country code like 65, show +65...
+    if (n.length > 6) return "+" + n;
+    return n;
+  }).join(", ");
 }
 
 // Initialise client
 const client = new Client({
-  authStrategy: new LocalAuth({ clientId: "modbot" }),
-  puppeteer: {
-    headless: true,
-    args: puppeteerArgs
-  }
+  authStrategy: new LocalAuth({ clientId: CLIENT_ID }),
+  puppeteer: puppeteerOptions
 });
+
+// cache my own id (reduces calls)
+let myId = null;
 
 client.on('qr', qr => {
   // Print QR to console for Railway logs and show printable QR
@@ -121,8 +163,17 @@ client.on('ready', async () => {
   try {
     console.log("WhatsApp client is ready.");
     loadWarnings();
+
+    // cache my id
+    try {
+      const me = await client.getMe();
+      myId = (me && me._serialized) ? me._serialized : null;
+    } catch (e) {
+      console.warn("Could not fetch own contact id on ready:", e && e.message ? e.message : e);
+    }
+
     console.log(`Moderation ${moderationActive ? "active" : "inactive"}. Target group: "${TARGET_GROUP_NAME}".`);
-    
+
     // Attempt to find the target group chat by name
     try {
       const chats = await client.getChats();
@@ -153,7 +204,7 @@ client.on('ready', async () => {
       console.error("Failed to send startup notification:", e && e.message ? e.message : e);
     }
   } catch (err) {
-    console.error("Error in ready handler:", err);
+    console.error("Error in ready handler:", err && err.message ? err.message : err);
   }
 });
 
@@ -172,7 +223,7 @@ client.on('message', async (message) => {
 
     // Helper to reply in same chat
     const reply = async (text) => {
-      try { await client.sendMessage(message.from, text); } catch (e) { console.error("Reply failed:", e); }
+      try { await client.sendMessage(message.from, text); } catch (e) { console.error("Reply failed:", e && e.message ? e.message : e); }
     };
 
     // COMMANDS (only from allowedNumbers)
@@ -180,24 +231,24 @@ client.on('message', async (message) => {
 
     if (isAllowedNumberDigits(senderDigits)) {
       // recognise multiple variants (short and long forms)
+      const normalised = lowered.replace(/\s+/g, " ").trim();
       const startCommands = new Set(["start moderation", "startmod", "start moderation now", "start", "enable moderation", "enable"]);
       const stopCommands  = new Set(["stop moderation", "stopmod", "stop", "disable moderation", "disable"]);
-      if (startCommands.has(lowered) || startCommands.has(lowered.replace(/\s+/g," "))) {
+      if (startCommands.has(normalised)) {
         moderationActive = true;
         await reply("✅ Moderation started.");
         console.log(`Moderation started by ${senderDigits}`);
         return;
       }
-      if (stopCommands.has(lowered) || stopCommands.has(lowered.replace(/\s+/g," "))) {
+      if (stopCommands.has(normalised)) {
         moderationActive = false;
         await reply("⛔ Moderation stopped.");
         console.log(`Moderation stopped by ${senderDigits}`);
         return;
       }
       // other admin commands: check warnings for a user
-      if (lowered.startsWith("check warnings")) {
-        // allow forms: "check warnings 659xxxxxxxx" or "check warnings @123..."
-        const parts = lowered.split(/\s+/);
+      if (normalised.startsWith("check warnings")) {
+        const parts = normalised.split(/\s+/);
         const target = parts[2] || parts[1];
         if (!target) {
           await reply("Usage: check warnings <phoneDigits>");
@@ -209,8 +260,8 @@ client.on('message', async (message) => {
         return;
       }
       // allow resetting a user's warnings
-      if (lowered.startsWith("reset warnings")) {
-        const parts = lowered.split(/\s+/);
+      if (normalised.startsWith("reset warnings")) {
+        const parts = normalised.split(/\s+/);
         const target = parts[2] || parts[1];
         if (!target) {
           await reply("Usage: reset warnings <phoneDigits>");
@@ -238,19 +289,16 @@ client.on('message', async (message) => {
     const offenderId = message.author || message.from; // as an id like "659xxxx@c.us" or "659xxxx@g.us"
     const offenderDigits = extractDigitsFromId(offenderId);
 
-    // Ignore messages from the bot itself
-    const me = (await client.getMe())._serialized;
-    if (offenderId && offenderId.includes(me)) return;
+    // Ignore messages from the bot itself (compare digits)
+    if (myId && extractDigitsFromId(myId) && offenderDigits === extractDigitsFromId(myId)) return;
 
     // If message has no body (stickers/media) - optionally skip
     const body = (message.body || "").trim();
     if (!body) return;
 
-    // Check for banned words using regex word boundaries
+    // Check for banned words using the robust regex
     let matched = false;
-    if (bannedRegex) {
-      matched = bannedRegex.test(body);
-    }
+    if (bannedRegex) matched = bannedRegex.test(body);
 
     if (!matched) return; // nothing to do
 
@@ -258,14 +306,15 @@ client.on('message', async (message) => {
 
     // Attempt to delete the offending message
     try {
+      // delete for everyone (requires admin)
       await message.delete(true);
       console.log("Deleted offending message.");
     } catch (e) {
-      console.warn("Failed to delete message (bot may not be admin):", e.message || e);
+      console.warn("Failed to delete message (bot may not be admin):", e && e.message ? e.message : e);
       // notify group that bot needs admin for deletion
       try {
         await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it. Please set me as group admin to allow moderation actions.");
-      } catch {}
+      } catch (sendErr) {}
     }
 
     // Increment warning count
@@ -281,9 +330,10 @@ client.on('message', async (message) => {
     } catch (e) {
       // fallback: mention in group
       try {
-        await chat.sendMessage(`@${offenderDigits} ${warnTextPrivate}`, { mentions: [(await client.getContactById(offenderId))] });
+        const contact = await client.getContactById(offenderId);
+        await chat.sendMessage(`@${offenderDigits} ${warnTextPrivate}`, { mentions: contact ? [contact] : [] });
       } catch (e2) {
-        console.warn("Failed to notify offender privately or in group:", e2.message || e2);
+        console.warn("Failed to notify offender privately or in group:", e2 && e2.message ? e2.message : e2);
       }
     }
 
@@ -296,19 +346,21 @@ client.on('message', async (message) => {
         delete warnings[offenderDigits];
         saveWarnings();
       } catch (e) {
-        console.error("Failed to remove participant (ensure bot is admin):", e.message || e);
+        console.error("Failed to remove participant (ensure bot is admin):", e && e.message ? e.message : e);
         try {
-          await chat.sendMessage(`⚠️ I would remove <@${offenderDigits}> for repeated banned language, but I couldn't — please make me a group admin or remove them manually.`, { mentions: [(await client.getContactById(offenderId))] });
-        } catch {}
+          const contact = await client.getContactById(offenderId);
+          await chat.sendMessage(`⚠️ I would remove @${offenderDigits} for repeated banned language, but I couldn't — please make me a group admin or remove them manually.`, { mentions: contact ? [contact] : [] });
+        } catch (e2) {}
       }
     }
 
   } catch (err) {
-    console.error("Error handling message:", err);
+    console.error("Error handling message:", err && err.message ? err.message : err);
   }
 });
 
 // Start client
 client.initialize().catch(err => {
-  console.error("Failed to start WhatsApp client:", err);
+  console.error("Failed to start WhatsApp client:", err && err.message ? err.message : err);
 });
+                                
