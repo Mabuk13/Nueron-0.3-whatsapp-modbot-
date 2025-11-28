@@ -359,6 +359,8 @@ client.on('ready', async () => {
           `Configured admin numbers: ${humanListAllowedNumbers()}`,
           "",
           "Note: The bot needs to be a group admin to delete messages or remove participants."
+          "For more info on Nueron0.3 project click here: https://mabuk13.github.io/Nueron0.3-site/"
+        "Bot is made my Cookie Developments all rights reserved"
         ].join("\n");
         await targetChat.sendMessage(startupMsg).catch(() => {});
       }
