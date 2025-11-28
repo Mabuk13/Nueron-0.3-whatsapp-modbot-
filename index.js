@@ -503,4 +503,4 @@ client.on('message', async (message) => {
 client.initialize().catch(err => {
   console.error("Failed to start WhatsApp client:", err?.message || err);
 });
-                     
+                                   
