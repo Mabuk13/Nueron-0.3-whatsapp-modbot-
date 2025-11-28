@@ -65,7 +65,7 @@ if (FORCE_QR) {
     if (fs.existsSync(LOCAL_AUTH_BASE)) {
       if (fs.rmSync) fs.rmSync(LOCAL_AUTH_BASE, { recursive: true, force: true });
       else fs.rmdirSync(LOCAL_AUTH_BASE, { recursive: true });
-      log(`FORCE_QR enabled — removed LocalAuth folder: ${LOCAL_AUTH_BASE}`);
+      log(`FORCE_QR enabled — removed LocalAuth folder: ${LOCAL_AUTH_BASE}`); 
     } else {
       log("FORCE_QR enabled — no existing LocalAuth folder to remove.");
     }
