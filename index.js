@@ -13,6 +13,7 @@
  *  - Refresh group metadata before admin actions + retry delete
  *  - Robust own-id extraction (no client.getMe dependency)
  *  - Minimal HTTP health/status endpoint for Railway
+ *  - Reset warnings on every startup (backs previous file up)
  */
 
 /** ----------------- Moderation rules (exact snippet requested) ----------------- */
@@ -27,11 +28,8 @@ const fsp = fs.promises;
 const path = require("path");
 const http = require("http");
 
-// ---------- Configuration from environment ----------
-const TARGET_GROUPS = (process.env.TARGET_GROUPS
-  ? process.env.TARGET_GROUPS.split(",").map(s => s.trim()).filter(Boolean)
-  : ["6-3 of '25", "⭒๋𐙚 6MAJ 2025 ֶָ֢ᯓ★"]
-);
+// ---------- Configuration (hardcoded target group as requested) ----------
+const TARGET_GROUPS = ["6-3 of '25"]; // ONLY target this group for now
 
 const WARNINGS_FILE = path.resolve(process.env.WARNINGS_FILE || path.join(__dirname, "warnings.json"));
 const WARNINGS_THRESHOLD = parseInt(process.env.WARNINGS_THRESHOLD || "3", 10);
@@ -97,13 +95,40 @@ async function ensureDirForFile(filePath) {
   try { await fsp.mkdir(dir, { recursive: true }); } catch (e) { /* ignore */ }
 }
 
+// ----------------- Reset warnings on redeploy/startup -----------------
+// Back up existing warnings file (if present) and start fresh on every startup.
+async function resetWarningsOnStartup() {
+  try {
+    await ensureDirForFile(WARNINGS_FILE);
+    if (fs.existsSync(WARNINGS_FILE)) {
+      const ts = (new Date()).toISOString().replace(/[:.]/g, "-");
+      const bak = `${WARNINGS_FILE}.bak.${ts}`;
+      try {
+        await fsp.rename(WARNINGS_FILE, bak);
+        log(`Reset on startup — backed up previous warnings to: ${bak}`);
+      } catch (e) {
+        warn("Failed to back up warnings file during reset:", e?.message || e);
+        // try copy fallback
+        try { await fsp.copyFile(WARNINGS_FILE, bak); await fsp.unlink(WARNINGS_FILE); log(`Copied warnings to backup then removed original: ${bak}`); } catch (e2) { warn("Backup fallback failed:", e2?.message || e2); }
+      }
+    } else {
+      log("No existing warnings file to back up on startup.");
+    }
+    // start with empty warnings and persist empty file (best-effort)
+    warnings = {};
+    try { await saveWarnings(); } catch (e) { warn("Failed to persist empty warnings on startup:", e?.message || e); }
+  } catch (e) {
+    warn("Could not reset warnings on startup:", e?.message || e);
+  }
+}
+
 // Load warnings from disk safely.
-// If JSON parse fails, move the corrupted file to a backup and continue with empty store.
+// (This now only loads if reset on startup didn't already clear it — but we always reset above)
 async function loadWarnings() {
   try {
     await ensureDirForFile(WARNINGS_FILE);
     const exists = fs.existsSync(WARNINGS_FILE);
-    if (!exists) { warnings = {}; return; }
+    if (!exists) { warnings = {}; log("Warnings store empty (no file)."); return; }
     const raw = await fsp.readFile(WARNINGS_FILE, "utf8");
     try {
       const parsed = JSON.parse(raw || "{}");
@@ -175,38 +200,27 @@ let clientReady = false;
 // Robust extractor for the client's own ID — works across wwebjs versions & shapes
 function serializeWidObject(wid) {
   if (!wid) return null;
-  // If it's already a serialized string
   if (typeof wid === "string") return wid;
-  // Known shapes: { _serialized: '659...@c.us' } or { id: '659...', server: 'c.us' } or { user: '659...', server: 'c.us' }
   if (wid._serialized) return wid._serialized;
   if (wid.id && typeof wid.id === "string") return wid.id;
   if (wid.user) {
     const server = wid.server || (wid.domain ? wid.domain : "c.us");
     return `${wid.user}@${server}`;
   }
-  // fallback: try toString
-  try {
-    if (typeof wid.toString === "function") return wid.toString();
-  } catch (e) {}
+  try { if (typeof wid.toString === "function") return wid.toString(); } catch (e) {}
   return null;
 }
 
 function determineOwnIdFromClientInfo(info) {
   try {
     if (!info) return null;
-    // preferred: info.wid
     if (info.wid) {
       const s = serializeWidObject(info.wid);
       if (s) return s;
     }
-    // older: info.me (deprecated)
     if (info.me) {
       const s = serializeWidObject(info.me);
       if (s) return s;
-    }
-    // fallback: info.phone ? (rare)
-    if (info.phone && info.phone.wa_version) {
-      // not an id, ignore
     }
     return null;
   } catch (e) {
@@ -291,29 +305,30 @@ client.on('ready', async () => {
   try {
     clientReady = true;
     log("WhatsApp client is ready.");
+
+    // Reset warnings on startup (backup previous file then start empty)
+    await resetWarningsOnStartup();
+
+    // After reset, try load (will find empty file or just-initialised)
     await loadWarnings();
 
     // determine own id robustly from client.info
     try {
-      const info = client.info || null; // client.info is the supported property
+      const info = client.info || null;
       const deduced = determineOwnIdFromClientInfo(info);
       if (deduced) {
         myId = deduced;
         log("Determined own id from client.info:", myId);
       } else {
-        // last-resort: try to inspect any exposed properties
-        try {
-          // Some versions may expose pupBrowser/pupPage; avoid evaluating in page here.
-          log("Warning: could not deduce own id from client.info; some admin features may not work until metadata is available.");
-        } catch {}
+        log("Warning: could not deduce own id from client.info; some admin features may not work until metadata is available.");
       }
     } catch (e) {
       warn("Could not fetch own contact id on ready (info extraction failed):", e?.message || e);
     }
 
-    log(`Moderation ${moderationActive ? "active" : "inactive"}. Target groups: ${TARGET_GROUPS.join(" | ")}`);
+    log(`Moderation ${moderationActive ? "active" : "inactive"}. Target group: ${TARGET_GROUPS.join(" | ")}`);
 
-    // Inform each found group that bot is online (best-effort) and log admin status
+    // Inform the (single) target group that bot is online (best-effort) and log admin status
     try {
       const chats = await client.getChats();
       for (const groupName of TARGET_GROUPS) {
@@ -540,3 +555,4 @@ startHttpServer();
 client.initialize().catch(err => {
   console.error("Failed to start WhatsApp client:", err?.message || err);
 });
+
