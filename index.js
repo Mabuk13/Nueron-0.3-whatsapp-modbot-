@@ -17,8 +17,8 @@
  */
 
 /** ----------------- Moderation rules (exact snippet requested) ----------------- */
-const bannedWords = new Set((process.env.BANNED_WORDS || "fuck,shit,hell,damn,bitch,ass,bastard,femboy,dih,dick,pussy").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
-const allowedNumbers = (process.env.ALLOWED_NUMBERS || "6580480362,6585038335").split(",").map(s => s.replace(/\D/g,"")).filter(Boolean);
+const bannedWords = new Set((process.env.BANNED_WORDS || "fuck,shit,bitch,asshole,ass,damn,hell,bastard,dick,pussy,cunt,slut,whore,fag,faggot,dyke,prick,jerk,twat,bugger,bollocks,arse,arsehole,moron,idiot,retard,shithead,crap,douche,douchebag,motherfucker,son of a bitch,piss,pissed,pisser,ballbag,ballsack,knob,knobhead,knobend,clit,cooch,cooter,tits,boobs,boobies,scrote,scrotum,nutsack,boner,wang,schlong,deepthroat,handjob,blowjob,blow job,anal,anus,vulva,cock,suck my dick,suckmydick,dickhead,piss off,piss-off,shitbag,shitter,bullshit,bull shit,horse shit,batshit,bat shit,holy shit,fuck off,fuckoff,fuckface,fuck face,shitface,shit face,crackhead,dumbass,dumb ass,dumbfuck,dumb fuck,asshat,ass hat,asswipe,ass wipe,numbnuts,numb nuts,retarded,spaz,nonce,wanker,skank,thot,hoe, walao, shut up, Harish, femboy, sfs, f4f, f4p").split(",").map(s => s.trim().toLowerCase()).filter(Boolean));
+const allowedNumbers = (process.env.ALLOWED_NUMBERS || "6580480362,6585038335,6588112480,6581352028").split(",").map(s => s.replace(/\D/g,"")).filter(Boolean);
 /* ------------------------------------------------------------------------------ */
 
 const { Client, LocalAuth } = require("whatsapp-web.js");
@@ -29,7 +29,7 @@ const path = require("path");
 const http = require("http");
 
 // ---------- Configuration (hardcoded target group as requested) ----------
-const TARGET_GROUPS = ["6-3 of '25"]; // ONLY target this group for now
+const TARGET_GROUPS = ["6-3 of '25","chat gc <3"]; // ONLY target this group for now
 
 const WARNINGS_FILE = path.resolve(process.env.WARNINGS_FILE || path.join(__dirname, "warnings.json"));
 const WARNINGS_THRESHOLD = parseInt(process.env.WARNINGS_THRESHOLD || "3", 10);
@@ -348,7 +348,7 @@ client.on('ready', async () => {
         }
 
         const startupMsg = [
-          "🤖 Moderation Bot ONLINE",
+          "🤖 Nueron0.3 modbot ONLINE",
           `Group: "${groupName}"`,
           `Moderation state: ${moderationActive ? "**Active**" : "**Inactive**"}.`,
           `Bot admin: ${amAdmin ? "Yes" : "No (please make me admin to allow delete/remove actions)"}`,
