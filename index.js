@@ -7,6 +7,11 @@
  *  - Back up corrupted JSON if detected
  *  - Queue saves within the process to avoid races
  *  - Graceful fallback to memory-only if disk is not writable
+ *
+ * Minor improvements for reliability:
+ *  - Admin-status checks before attempting delete-for-everyone
+ *  - Re-fetch / refresh group metadata if delete fails
+ *  - Better logging + helpful group notifications when actions fail
  */
 
 /** ----------------- Moderation rules (exact snippet requested) ----------------- */
@@ -20,12 +25,16 @@ const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
 
-// MULTI-GROUP SUPPORT (adjust names as required)
-const TARGET_GROUPS = [
-  "6-3 of '25",
-  "⭒๋𐙚 6MAJ 2025 ֶָ֢ᯓ★"
-];
+// MULTI-GROUP SUPPORT (from env or fallback to your original list)
+const TARGET_GROUPS = (process.env.TARGET_GROUPS
+  ? process.env.TARGET_GROUPS.split(",").map(s => s.trim()).filter(Boolean)
+  : [
+    "6-3 of '25",
+    "⭒๋𐙚 6MAJ 2025 ֶָ֢ᯓ★"
+  ]
+);
 
+// Files & thresholds
 const WARNINGS_FILE = path.resolve(process.env.WARNINGS_FILE || path.join(__dirname, "warnings.json"));
 const WARNINGS_THRESHOLD = parseInt(process.env.WARNINGS_THRESHOLD || "3", 10);
 let moderationActive = (process.env.MODERATION_ACTIVE || "true").toLowerCase() === "true";
@@ -34,6 +43,7 @@ const FORCE_QR = (process.env.FORCE_QR || "false").toLowerCase() === "true";
 const CLIENT_ID = "modbot";
 const LOCAL_AUTH_BASE = path.join(process.cwd(), ".wwebjs_auth", CLIENT_ID);
 
+// Puppeteer options (Railway often needs a specific CHROMIUM_PATH)
 const puppeteerArgs = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -220,7 +230,7 @@ client.on('ready', async () => {
 
     console.log(`Moderation ${moderationActive ? "active" : "inactive"}. Target groups: ${TARGET_GROUPS.join(" | ")}`);
 
-    // Inform each found group that bot is online (best-effort)
+    // Inform each found group that bot is online (best-effort) and log admin status
     try {
       const chats = await client.getChats();
       for (const groupName of TARGET_GROUPS) {
@@ -229,10 +239,20 @@ client.on('ready', async () => {
           console.warn(`Target group "${groupName}" not found. Startup notification not sent for that group.`);
           continue;
         }
+        // Try to detect admin status from participants (best-effort)
+        let amAdmin = false;
+        try {
+          const participant = targetChat.participants && targetChat.participants.find(p => (p.id && p.id._serialized) === myId);
+          amAdmin = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
+        } catch (e) {
+          // ignore
+        }
+
         const startupMsg = [
           "🤖 Moderation Bot ONLINE",
           `Group: "${groupName}"`,
           `Moderation state: ${moderationActive ? "**Active**" : "**Inactive**"}.`,
+          `Bot admin: ${amAdmin ? "Yes" : "No (please make me admin to allow delete/remove actions)"}`,
           "",
           "How to control moderation:",
           `• Admins listed in configuration can start moderation by sending the command: "start moderation"`,
@@ -255,6 +275,24 @@ client.on('ready', async () => {
 client.on('disconnected', reason => {
   console.warn("Client disconnected:", reason);
 });
+
+// Helper: refresh chat metadata (participants) — best-effort
+async function refreshChatParticipants(chat) {
+  try {
+    // Attempt to fetch a fresh copy of the chat from the client
+    // client.getChatById is present in many versions; if absent fall back to client.getChats()
+    if (client.getChatById) {
+      const fresh = await client.getChatById(chat.id._serialized);
+      return fresh || chat;
+    } else {
+      const chats = await client.getChats();
+      const found = chats.find(c => c.id._serialized === chat.id._serialized);
+      return found || chat;
+    }
+  } catch (e) {
+    return chat;
+  }
+}
 
 // MAIN MESSAGE HANDLER
 client.on('message', async (message) => {
@@ -342,14 +380,56 @@ client.on('message', async (message) => {
 
     console.log(`Banned content detected from ${offenderDigits} in "${chat.name}":`, body);
 
-    // Try to delete the offending message
+    // Before attempting delete-for-everyone, check if bot is admin in this group.
+    // Refresh participants first to increase chance of up-to-date status.
+    let amAdmin = false;
     try {
-      await message.delete(true);
-      console.log("Deleted offending message.");
+      const refreshed = await refreshChatParticipants(chat);
+      const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
+      amAdmin = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
     } catch (e) {
-      console.warn("Failed to delete offending message (bot may not be admin):", e?.message || e);
+      console.warn("Could not determine admin status:", e?.message || e);
+    }
+
+    // Try to delete the offending message (prefer everyone). If not admin, skip and notify.
+    if (amAdmin) {
       try {
-        await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it. Please set me as group admin to allow moderation actions.");
+        await message.delete(true);
+        console.log("Deleted offending message for everyone.");
+      } catch (e) {
+        console.warn("Failed to delete for everyone on first attempt:", e?.message || e);
+        // Try to refresh metadata and retry once
+        try {
+          const refreshed = await refreshChatParticipants(chat);
+          const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
+          const nowAdmin = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
+          if (nowAdmin) {
+            try {
+              await message.delete(true);
+              console.log("Deleted offending message for everyone on retry after refresh.");
+            } catch (e2) {
+              console.warn("Retry delete-for-everyone failed:", e2?.message || e2);
+              await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone even though I'm an admin. There may be a WhatsApp deletion limit or throttling in effect.");
+            }
+          } else {
+            // Not admin after refresh
+            await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone — I am not an admin. Please make me a group admin to enable full moderation.");
+          }
+        } catch (refreshErr) {
+          console.warn("Failed to refresh participants after delete failure:", refreshErr?.message || refreshErr);
+          await chat.sendMessage("⚠️ I detected banned content but couldn't delete the message. Please ensure I am a group admin.");
+        }
+      }
+    } else {
+      // Not admin — we can attempt delete(false) (delete for me) but inform group
+      try {
+        await message.delete(); // best-effort delete for me
+        console.log("Deleted message for me (bot not admin).");
+      } catch (e) {
+        // ignore
+      }
+      try {
+        await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone. Please set me as group admin to allow moderation actions.");
       } catch {}
     }
 
@@ -378,17 +458,38 @@ client.on('message', async (message) => {
 
     // If threshold reached, attempt removal
     if (warnCount >= WARNINGS_THRESHOLD) {
-      try {
-        await chat.removeParticipants([offenderId]);
-        await chat.sendMessage(`User removed for repeated use of banned language (warnings: ${warnCount}).`);
-        delete warnings[offenderDigits];
-        await saveWarnings();
-      } catch (e) {
-        console.error("Failed to remove participant (ensure bot is admin):", e?.message || e);
+      // Re-check admin status before removal
+      let canRemove = amAdmin;
+      if (!canRemove) {
+        try {
+          const refreshed = await refreshChatParticipants(chat);
+          const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
+          canRemove = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      if (canRemove) {
+        try {
+          await chat.removeParticipants([offenderId]);
+          await chat.sendMessage(`User removed for repeated use of banned language (warnings: ${warnCount}).`);
+          delete warnings[offenderDigits];
+          await saveWarnings();
+        } catch (e) {
+          console.error("Failed to remove participant (ensure bot is admin):", e?.message || e);
+          try {
+            const contact = await client.getContactById(offenderId);
+            await chat.sendMessage(`⚠️ I would remove @${offenderDigits} for repeated banned language, but I couldn't — please make me a group admin or remove them manually.`, { mentions: contact ? [contact] : [] });
+          } catch {}
+        }
+      } else {
         try {
           const contact = await client.getContactById(offenderId);
-          await chat.sendMessage(`⚠️ I would remove @${offenderDigits} for repeated banned language, but I couldn't — please make me a group admin or remove them manually.`, { mentions: contact ? [contact] : [] });
-        } catch {}
+          await chat.sendMessage(`⚠️ User has reached ${warnCount} warnings and should be removed, but I cannot remove participants because I'm not an admin. Please remove @${offenderDigits} manually.`, { mentions: contact ? [contact] : [] });
+        } catch {
+          await chat.sendMessage(`⚠️ User has reached ${warnCount} warnings and should be removed, but I cannot remove participants because I'm not an admin. Please remove them manually.`);
+        }
       }
     }
 
@@ -402,5 +503,4 @@ client.on('message', async (message) => {
 client.initialize().catch(err => {
   console.error("Failed to start WhatsApp client:", err?.message || err);
 });
-  
-                                
+                     
