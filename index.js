@@ -8,10 +8,11 @@
  *  - Queue saves within the process to avoid races
  *  - Graceful fallback to memory-only if disk is not writable
  *
- * Minor improvements for reliability:
- *  - Admin-status checks before attempting delete-for-everyone
- *  - Re-fetch / refresh group metadata if delete fails
- *  - Better logging + helpful group notifications when actions fail
+ * Improvements:
+ *  - Per-group admin detection (one non-admin group won't disable others)
+ *  - Refresh group metadata before admin actions + retry delete
+ *  - Robust own-id extraction (no client.getMe dependency)
+ *  - Minimal HTTP health/status endpoint for Railway
  */
 
 /** ----------------- Moderation rules (exact snippet requested) ----------------- */
@@ -24,24 +25,22 @@ const qrcode = require("qrcode-terminal");
 const fs = require("fs");
 const fsp = fs.promises;
 const path = require("path");
+const http = require("http");
 
-// MULTI-GROUP SUPPORT (from env or fallback to your original list)
+// ---------- Configuration from environment ----------
 const TARGET_GROUPS = (process.env.TARGET_GROUPS
   ? process.env.TARGET_GROUPS.split(",").map(s => s.trim()).filter(Boolean)
-  : [
-    "6-3 of '25",
-    "⭒๋𐙚 6MAJ 2025 ֶָ֢ᯓ★"
-  ]
+  : ["6-3 of '25", "⭒๋𐙚 6MAJ 2025 ֶָ֢ᯓ★"]
 );
 
-// Files & thresholds
 const WARNINGS_FILE = path.resolve(process.env.WARNINGS_FILE || path.join(__dirname, "warnings.json"));
 const WARNINGS_THRESHOLD = parseInt(process.env.WARNINGS_THRESHOLD || "3", 10);
 let moderationActive = (process.env.MODERATION_ACTIVE || "true").toLowerCase() === "true";
 
 const FORCE_QR = (process.env.FORCE_QR || "false").toLowerCase() === "true";
-const CLIENT_ID = "modbot";
-const LOCAL_AUTH_BASE = path.join(process.cwd(), ".wwebjs_auth", CLIENT_ID);
+const CLIENT_ID = process.env.CLIENT_ID || "modbot";
+
+const HTTP_PORT = parseInt(process.env.PORT || process.env.HTTP_PORT || "3000", 10);
 
 // Puppeteer options (Railway often needs a specific CHROMIUM_PATH)
 const puppeteerArgs = [
@@ -56,18 +55,24 @@ const puppeteerArgs = [
 const puppeteerOptions = { headless: true, args: puppeteerArgs };
 if (process.env.CHROMIUM_PATH) puppeteerOptions.executablePath = process.env.CHROMIUM_PATH;
 
+// ---------- Utilities ----------
+function timestamp() { return (new Date()).toISOString(); }
+function log(...args) { console.log(timestamp(), ...args); }
+function warn(...args) { console.warn(timestamp(), ...args); }
+
 // If user requested a forced QR, attempt to remove LocalAuth folder (best-effort)
+const LOCAL_AUTH_BASE = path.join(process.cwd(), ".wwebjs_auth", CLIENT_ID);
 if (FORCE_QR) {
   try {
     if (fs.existsSync(LOCAL_AUTH_BASE)) {
       if (fs.rmSync) fs.rmSync(LOCAL_AUTH_BASE, { recursive: true, force: true });
       else fs.rmdirSync(LOCAL_AUTH_BASE, { recursive: true });
-      console.log(`FORCE_QR enabled — removed LocalAuth folder: ${LOCAL_AUTH_BASE}`);
+      log(`FORCE_QR enabled — removed LocalAuth folder: ${LOCAL_AUTH_BASE}`);
     } else {
-      console.log("FORCE_QR enabled — no existing LocalAuth folder to remove.");
+      log("FORCE_QR enabled — no existing LocalAuth folder to remove.");
     }
   } catch (e) {
-    console.warn("FORCE_QR: failed to remove LocalAuth folder:", e?.message || e);
+    warn("FORCE_QR: failed to remove LocalAuth folder:", e?.message || e);
   }
 }
 
@@ -89,11 +94,7 @@ let saveQueued = false;
 // Ensure warnings directory exists
 async function ensureDirForFile(filePath) {
   const dir = path.dirname(filePath);
-  try {
-    await fsp.mkdir(dir, { recursive: true });
-  } catch (e) {
-    // ignore: may fail on readonly FS
-  }
+  try { await fsp.mkdir(dir, { recursive: true }); } catch (e) { /* ignore */ }
 }
 
 // Load warnings from disk safely.
@@ -102,38 +103,26 @@ async function loadWarnings() {
   try {
     await ensureDirForFile(WARNINGS_FILE);
     const exists = fs.existsSync(WARNINGS_FILE);
-    if (!exists) {
-      warnings = {};
-      return;
-    }
+    if (!exists) { warnings = {}; return; }
     const raw = await fsp.readFile(WARNINGS_FILE, "utf8");
     try {
       const parsed = JSON.parse(raw || "{}");
-      // Normalise keys to digits-only (in case old data used serialized IDs)
       const normalised = {};
       for (const key of Object.keys(parsed || {})) {
         const digits = key.replace(/\D/g, "");
         normalised[digits || key] = parsed[key];
       }
       warnings = normalised;
+      log("Loaded warnings from disk.");
     } catch (parseErr) {
-      // Backup corrupted file with timestamp
       const ts = (new Date()).toISOString().replace(/[:.]/g, "-");
       const corruptPath = `${WARNINGS_FILE}.corrupt.${ts}`;
-      try {
-        await fsp.rename(WARNINGS_FILE, corruptPath);
-        console.error(`Warnings file corrupted — moved to ${corruptPath}. Starting with empty warnings store.`);
-      } catch (renameErr) {
-        console.error("Failed to back up corrupted warnings file:", renameErr?.message || renameErr);
-        // try to copy instead
-        try { await fsp.copyFile(WARNINGS_FILE, corruptPath); } catch {}
-      }
+      try { await fsp.rename(WARNINGS_FILE, corruptPath); log(`Corrupted warnings moved to ${corruptPath}`); } catch (renameErr) { warn("Failed to back up corrupted warnings file:", renameErr?.message || renameErr); try { await fsp.copyFile(WARNINGS_FILE, corruptPath); } catch {} }
       warnings = {};
     }
   } catch (err) {
-    console.error("Failed to load warnings from disk — continuing with in-memory store. Error:", err?.message || err);
+    warn("Failed to load warnings from disk — continuing with in-memory store. Error:", err?.message || err);
     warnings = {};
-    // mark disk writes disabled to avoid noisy repeated errors
     diskWritesDisabled = true;
   }
 }
@@ -141,52 +130,32 @@ async function loadWarnings() {
 // Atomic save function with simple in-process queuing.
 // Writes to a temp file then renames into place. On failure sets diskWritesDisabled.
 async function saveWarnings() {
-  // If disk writes disabled, resolve immediately (in-memory only)
   if (diskWritesDisabled) return;
-
-  // If a save is already in progress, queue another save and return
-  if (saveInProgress) {
-    saveQueued = true;
-    return;
-  }
+  if (saveInProgress) { saveQueued = true; return; }
   saveInProgress = true;
   try {
     await ensureDirForFile(WARNINGS_FILE);
     const tmpPath = `${WARNINGS_FILE}.tmp`;
     const data = JSON.stringify(warnings, null, 2);
-
-    // Write to temp file first
     await fsp.writeFile(tmpPath, data, { encoding: "utf8", flag: "w" });
-
-    // fsync is platform-dependent via filehandle; rename is typically atomic on POSIX
     await fsp.rename(tmpPath, WARNINGS_FILE);
+    log("Saved warnings to disk.");
   } catch (err) {
     console.error("Failed to save warnings to disk. Disabling disk writes. Error:", err?.message || err);
     diskWritesDisabled = true;
-    // Attempt to clean up temp file if present
     try { if (fs.existsSync(`${WARNINGS_FILE}.tmp`)) await fsp.unlink(`${WARNINGS_FILE}.tmp`); } catch {}
   } finally {
     saveInProgress = false;
-    if (saveQueued) {
-      saveQueued = false;
-      // schedule next save (don't await here to avoid re-entrancy)
-      saveWarnings().catch(e => console.error("Queued save failed:", e?.message || e));
-    }
+    if (saveQueued) { saveQueued = false; saveWarnings().catch(e => warn("Queued save failed:", e?.message || e)); }
   }
 }
 
 // Normalise id -> digits string (used as key)
-function extractDigitsFromId(id) {
-  if (!id) return "";
-  return id.replace(/\D/g, "");
-}
+function extractDigitsFromId(id) { if (!id) return ""; return id.replace(/\D/g, ""); }
 
 function isAllowedNumberDigits(digits) {
   if (!digits) return false;
-  return allowedNumbers.some(n => {
-    if (!n) return false;
-    return digits === n || digits.endsWith(n) || n.endsWith(digits);
-  });
+  return allowedNumbers.some(n => { if (!n) return false; return digits === n || digits.endsWith(n) || n.endsWith(digits); });
 }
 
 function humanListAllowedNumbers() {
@@ -200,15 +169,118 @@ const client = new Client({
   puppeteer: puppeteerOptions
 });
 
-let myId = null;
+let myId = null;           // serialized id like "659xxxxxxxx@c.us"
+let clientReady = false;
 
+// Robust extractor for the client's own ID — works across wwebjs versions & shapes
+function serializeWidObject(wid) {
+  if (!wid) return null;
+  // If it's already a serialized string
+  if (typeof wid === "string") return wid;
+  // Known shapes: { _serialized: '659...@c.us' } or { id: '659...', server: 'c.us' } or { user: '659...', server: 'c.us' }
+  if (wid._serialized) return wid._serialized;
+  if (wid.id && typeof wid.id === "string") return wid.id;
+  if (wid.user) {
+    const server = wid.server || (wid.domain ? wid.domain : "c.us");
+    return `${wid.user}@${server}`;
+  }
+  // fallback: try toString
+  try {
+    if (typeof wid.toString === "function") return wid.toString();
+  } catch (e) {}
+  return null;
+}
+
+function determineOwnIdFromClientInfo(info) {
+  try {
+    if (!info) return null;
+    // preferred: info.wid
+    if (info.wid) {
+      const s = serializeWidObject(info.wid);
+      if (s) return s;
+    }
+    // older: info.me (deprecated)
+    if (info.me) {
+      const s = serializeWidObject(info.me);
+      if (s) return s;
+    }
+    // fallback: info.phone ? (rare)
+    if (info.phone && info.phone.wa_version) {
+      // not an id, ignore
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Small helper to refresh chat/participants — best effort
+async function refreshChatParticipants(chat) {
+  try {
+    if (typeof client.getChatById === "function") {
+      const fresh = await client.getChatById(chat.id._serialized);
+      return fresh || chat;
+    } else {
+      const chats = await client.getChats();
+      const found = chats.find(c => c.id._serialized === chat.id._serialized);
+      return found || chat;
+    }
+  } catch (e) {
+    return chat;
+  }
+}
+
+// Per-group admin check (returns boolean)
+async function isBotAdminIn(chat) {
+  try {
+    const refreshed = await refreshChatParticipants(chat);
+    const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
+    return !!(participant && (participant.isAdmin || participant.isSuperAdmin));
+  } catch (e) {
+    return false;
+  }
+}
+
+// HTTP health/status server (no external deps)
+function startHttpServer() {
+  const server = http.createServer(async (req, res) => {
+    if (req.url === "/health" || req.url === "/") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true, ready: clientReady }));
+      return;
+    }
+    if (req.url === "/status") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        ok: true,
+        ready: clientReady,
+        moderationActive,
+        targetGroups: TARGET_GROUPS,
+        warningsCount: Object.keys(warnings).length
+      }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+  });
+
+  server.listen(HTTP_PORT, () => {
+    log(`HTTP health/status server listening on port ${HTTP_PORT}`);
+  });
+
+  server.on("error", (e) => {
+    warn("HTTP server error:", e?.message || e);
+  });
+}
+
+// Event handlers
 client.on('qr', qr => {
   qrcode.generate(qr, { small: true });
-  console.log("Scan the above QR (printed in logs).");
+  log("QR generated — scan it in your terminal logs.");
 });
 
 client.on('authenticated', () => {
-  console.log("Authenticated successfully.");
+  log("Authenticated successfully.");
 });
 
 client.on('auth_failure', msg => {
@@ -217,18 +289,29 @@ client.on('auth_failure', msg => {
 
 client.on('ready', async () => {
   try {
-    console.log("WhatsApp client is ready.");
+    clientReady = true;
+    log("WhatsApp client is ready.");
     await loadWarnings();
 
-    // cache own id
+    // determine own id robustly from client.info
     try {
-      const me = await client.getMe();
-      myId = (me && me._serialized) ? me._serialized : null;
+      const info = client.info || null; // client.info is the supported property
+      const deduced = determineOwnIdFromClientInfo(info);
+      if (deduced) {
+        myId = deduced;
+        log("Determined own id from client.info:", myId);
+      } else {
+        // last-resort: try to inspect any exposed properties
+        try {
+          // Some versions may expose pupBrowser/pupPage; avoid evaluating in page here.
+          log("Warning: could not deduce own id from client.info; some admin features may not work until metadata is available.");
+        } catch {}
+      }
     } catch (e) {
-      console.warn("Could not fetch own contact id on ready:", e?.message || e);
+      warn("Could not fetch own contact id on ready (info extraction failed):", e?.message || e);
     }
 
-    console.log(`Moderation ${moderationActive ? "active" : "inactive"}. Target groups: ${TARGET_GROUPS.join(" | ")}`);
+    log(`Moderation ${moderationActive ? "active" : "inactive"}. Target groups: ${TARGET_GROUPS.join(" | ")}`);
 
     // Inform each found group that bot is online (best-effort) and log admin status
     try {
@@ -236,13 +319,14 @@ client.on('ready', async () => {
       for (const groupName of TARGET_GROUPS) {
         const targetChat = chats.find(c => c.isGroup && c.name === groupName);
         if (!targetChat) {
-          console.warn(`Target group "${groupName}" not found. Startup notification not sent for that group.`);
+          warn(`Target group "${groupName}" not found. Startup notification not sent for that group.`);
           continue;
         }
-        // Try to detect admin status from participants (best-effort)
+        // Per-group admin detection
         let amAdmin = false;
         try {
-          const participant = targetChat.participants && targetChat.participants.find(p => (p.id && p.id._serialized) === myId);
+          const refreshed = await refreshChatParticipants(targetChat);
+          const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
           amAdmin = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
         } catch (e) {
           // ignore
@@ -264,50 +348,25 @@ client.on('ready', async () => {
         await targetChat.sendMessage(startupMsg).catch(() => {});
       }
     } catch (e) {
-      console.error("Failed to send some startup notifications:", e?.message || e);
+      warn("Failed to send some startup notifications:", e?.message || e);
     }
   } catch (err) {
     console.error("Error in ready handler:", err?.message || err);
   }
 });
 
-// Reconnection handler
 client.on('disconnected', reason => {
-  console.warn("Client disconnected:", reason);
+  warn("Client disconnected:", reason);
 });
-
-// Helper: refresh chat metadata (participants) — best-effort
-async function refreshChatParticipants(chat) {
-  try {
-    // Attempt to fetch a fresh copy of the chat from the client
-    // client.getChatById is present in many versions; if absent fall back to client.getChats()
-    if (client.getChatById) {
-      const fresh = await client.getChatById(chat.id._serialized);
-      return fresh || chat;
-    } else {
-      const chats = await client.getChats();
-      const found = chats.find(c => c.id._serialized === chat.id._serialized);
-      return found || chat;
-    }
-  } catch (e) {
-    return chat;
-  }
-}
 
 // MAIN MESSAGE HANDLER
 client.on('message', async (message) => {
   try {
-    // Always log when a message is read
-    console.log("MSG's read");
+    log("MSG received");
 
     // Ensure we can process this message
     let chat;
-    try {
-      chat = await message.getChat();
-    } catch (e) {
-      console.error("ERROR reading message: failed to get chat:", e?.message || e);
-      return;
-    }
+    try { chat = await message.getChat(); } catch (e) { console.error("ERROR reading message: failed to get chat:", e?.message || e); return; }
 
     if (!chat.isGroup) return; // only moderate groups
     if (!TARGET_GROUPS.includes(chat.name)) return; // ignore other groups
@@ -329,19 +388,25 @@ client.on('message', async (message) => {
     const senderDigits = authorDigits || fromDigits;
     const lowered = body.toLowerCase().replace(/\s+/g, " ").trim();
 
+    // ADMIN COMMANDS (from allowedNumbers)
     if (isAllowedNumberDigits(senderDigits)) {
       const startCommands = new Set(["start moderation", "startmod", "start moderation now", "start", "enable moderation", "enable"]);
       const stopCommands  = new Set(["stop moderation", "stopmod", "stop", "disable moderation", "disable"]);
       if (startCommands.has(lowered)) {
         moderationActive = true;
         await client.sendMessage(message.from, "✅ Moderation started.").catch(() => {});
-        console.log(`Moderation started by ${senderDigits}`);
+        log(`Moderation started by ${senderDigits}`);
         return;
       }
       if (stopCommands.has(lowered)) {
         moderationActive = false;
         await client.sendMessage(message.from, "⛔ Moderation stopped.").catch(() => {});
-        console.log(`Moderation stopped by ${senderDigits}`);
+        log(`Moderation stopped by ${senderDigits}`);
+        return;
+      }
+      if (lowered === "check admin") {
+        const am = await isBotAdminIn(chat);
+        await client.sendMessage(message.from, `Bot admin in this group: ${am ? "Yes" : "No"}`).catch(() => {});
         return;
       }
       if (lowered.startsWith("check warnings")) {
@@ -378,69 +443,44 @@ client.on('message', async (message) => {
     if (bannedRegex) matched = bannedRegex.test(body);
     if (!matched) return;
 
-    console.log(`Banned content detected from ${offenderDigits} in "${chat.name}":`, body);
+    log(`Banned content detected from ${offenderDigits} in "${chat.name}":`, body);
 
-    // Before attempting delete-for-everyone, check if bot is admin in this group.
-    // Refresh participants first to increase chance of up-to-date status.
+    // Per-group admin check (refresh participants)
     let amAdmin = false;
-    try {
-      const refreshed = await refreshChatParticipants(chat);
-      const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
-      amAdmin = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
-    } catch (e) {
-      console.warn("Could not determine admin status:", e?.message || e);
-    }
+    try { amAdmin = await isBotAdminIn(chat); } catch (e) { warn("Could not determine admin status:", e?.message || e); }
 
     // Try to delete the offending message (prefer everyone). If not admin, skip and notify.
     if (amAdmin) {
       try {
         await message.delete(true);
-        console.log("Deleted offending message for everyone.");
+        log("Deleted offending message for everyone.");
       } catch (e) {
-        console.warn("Failed to delete for everyone on first attempt:", e?.message || e);
-        // Try to refresh metadata and retry once
+        warn("Failed to delete for everyone on first attempt:", e?.message || e);
+        // Try one refresh + retry
         try {
           const refreshed = await refreshChatParticipants(chat);
           const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
           const nowAdmin = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
           if (nowAdmin) {
-            try {
-              await message.delete(true);
-              console.log("Deleted offending message for everyone on retry after refresh.");
-            } catch (e2) {
-              console.warn("Retry delete-for-everyone failed:", e2?.message || e2);
-              await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone even though I'm an admin. There may be a WhatsApp deletion limit or throttling in effect.");
-            }
+            try { await message.delete(true); log("Deleted offending message for everyone on retry after refresh."); }
+            catch (e2) { warn("Retry delete-for-everyone failed:", e2?.message || e2); await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone even though I'm an admin. There may be a WhatsApp deletion limit or throttling in effect.").catch(()=>{}); }
           } else {
-            // Not admin after refresh
-            await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone — I am not an admin. Please make me a group admin to enable full moderation.");
+            await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone — I am not an admin. Please make me a group admin to enable full moderation.").catch(()=>{});
           }
         } catch (refreshErr) {
-          console.warn("Failed to refresh participants after delete failure:", refreshErr?.message || refreshErr);
-          await chat.sendMessage("⚠️ I detected banned content but couldn't delete the message. Please ensure I am a group admin.");
+          warn("Failed to refresh participants after delete failure:", refreshErr?.message || refreshErr);
+          await chat.sendMessage("⚠️ I detected banned content but couldn't delete the message. Please ensure I am a group admin.").catch(()=>{});
         }
       }
     } else {
-      // Not admin — we can attempt delete(false) (delete for me) but inform group
-      try {
-        await message.delete(); // best-effort delete for me
-        console.log("Deleted message for me (bot not admin).");
-      } catch (e) {
-        // ignore
-      }
-      try {
-        await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone. Please set me as group admin to allow moderation actions.");
-      } catch {}
+      // Not admin — attempt delete for me (best-effort) and notify group
+      try { await message.delete(); log("Deleted message for me (bot not admin)."); } catch (e) { /* ignore */ }
+      try { await chat.sendMessage("⚠️ I detected banned content but I couldn't delete it for everyone in this group. Please set me as group admin to allow moderation actions.").catch(()=>{}); } catch {}
     }
 
     // Increment warning count using digits-only key
     warnings[offenderDigits] = (warnings[offenderDigits] || 0) + 1;
-    try {
-      await saveWarnings();
-    } catch (e) {
-      // saveWarnings handles diskErrors and sets diskWritesDisabled; just log here
-      console.error("Failed to persist warnings (will continue in-memory):", e?.message || e);
-    }
+    try { await saveWarnings(); } catch (e) { warn("Failed to persist warnings (will continue in-memory):", e?.message || e); }
 
     // Notify offender privately (best-effort)
     const warnCount = warnings[offenderDigits];
@@ -452,22 +492,19 @@ client.on('message', async (message) => {
         const contact = await client.getContactById(offenderId);
         await chat.sendMessage(`@${offenderDigits} ${warnTextPrivate}`, { mentions: contact ? [contact] : [] });
       } catch (e2) {
-        console.warn("Failed to notify offender privately or mention in group:", e2?.message || e2);
+        warn("Failed to notify offender privately or mention in group:", e2?.message || e2);
       }
     }
 
-    // If threshold reached, attempt removal
+    // If threshold reached, attempt removal (per-group admin check again)
     if (warnCount >= WARNINGS_THRESHOLD) {
-      // Re-check admin status before removal
       let canRemove = amAdmin;
       if (!canRemove) {
         try {
           const refreshed = await refreshChatParticipants(chat);
           const participant = (refreshed.participants || []).find(p => (p.id && p.id._serialized) === myId);
           canRemove = !!(participant && (participant.isAdmin || participant.isSuperAdmin));
-        } catch (e) {
-          // ignore
-        }
+        } catch (e) { /* ignore */ }
       }
 
       if (canRemove) {
@@ -494,13 +531,12 @@ client.on('message', async (message) => {
     }
 
   } catch (err) {
-    // If anything unexpected happens while reading/processing message, log a clear error
     console.error("ERROR reading message:", err?.message || err);
   }
 });
 
-// Start client
+// Start HTTP server for health/status and start WhatsApp client
+startHttpServer();
 client.initialize().catch(err => {
   console.error("Failed to start WhatsApp client:", err?.message || err);
 });
-                                   
