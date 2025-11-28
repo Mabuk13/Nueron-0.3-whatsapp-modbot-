@@ -358,9 +358,8 @@ client.on('ready', async () => {
           `• To stop moderation send: "stop moderation"`,
           `Configured admin numbers: ${humanListAllowedNumbers()}`,
           "",
-          "Note: The bot needs to be a group admin to delete messages or remove participants."
-          
-        "Bot is made my Cookie Developments all rights reserved"
+          "Note: The bot needs to be a group admin to delete messages or remove participants. ",
+          "For more info of the project click https://mabuk13.github.io/Nueron0.3-site/ , note this project is made by Cookie Developments all rights reserved"
         ].join("\n");
         await targetChat.sendMessage(startupMsg).catch(() => {});
       }
